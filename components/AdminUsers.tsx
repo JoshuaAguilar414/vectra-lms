@@ -1,0 +1,588 @@
+"use client";
+
+import { FormEvent, useCallback, useMemo, useState } from "react";
+import { CheckboxFilter, ColumnManager, matchesSelected, uniqueSorted } from "@/components/DataTableControls";
+import ListControls from "@/components/ListControls";
+import { csvFilename, downloadCsv } from "@/lib/csv-download";
+import { getUserFieldValue, type FieldDefinitionView } from "@/lib/fields";
+import type { UserView } from "@/lib/learners";
+import type { RoleView } from "@/lib/role-catalog";
+import { matchesQuery } from "@/lib/pagination";
+import { SPREADSHEET_ACCEPT } from "@/lib/spreadsheet";
+import { useFilteredPagination } from "@/lib/useFilteredPagination";
+
+type StakeholderGroup = "Business Partner" | "Facility";
+
+const FIXED_COLUMNS = [
+  { key: "learnerName", label: "Name" },
+  { key: "email", label: "Email" }
+];
+
+const TRAILING_COLUMNS = [
+  { key: "assignedCourses", label: "Assigned courses" },
+  { key: "role", label: "Role" },
+  { key: "status", label: "Status" }
+];
+
+export default function AdminUsers({
+  initialUsers,
+  fields,
+  roles,
+  permissions
+}: {
+  initialUsers: UserView[];
+  fields: FieldDefinitionView[];
+  roles: RoleView[];
+  permissions: {
+    canCreateStaff: boolean;
+    canRemoveUsers: boolean;
+  };
+}) {
+  const [users, setUsers] = useState(initialUsers);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [role, setRole] = useState("LEARNER");
+  const [stakeholderGroup, setStakeholderGroup] = useState<StakeholderGroup | "">("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+  const [filters, setFilters] = useState<Record<string, string[]>>({});
+
+  const fieldColumns = useMemo(
+    () => fields.map((field) => ({ key: field.key, label: field.key === "name" ? "Entity" : field.label })),
+    [fields]
+  );
+  const tableColumns = useMemo(
+    () => [...FIXED_COLUMNS, ...fieldColumns, ...TRAILING_COLUMNS],
+    [fieldColumns]
+  );
+  const [visibleColumns, setVisibleColumns] = useState<string[]>(() =>
+    tableColumns.map((column) => column.key)
+  );
+
+  const filterableFields = fields.filter((field) => field.filterable);
+  const editing = users.find((item) => item.id === editingId) || null;
+
+  const getSearchValues = useCallback(
+    (item: UserView) => [
+      item.firstName,
+      item.lastName,
+      item.email,
+      item.entity,
+      item.companyId,
+      item.stakeholderGroup,
+      item.role,
+      item.status,
+      ...(item.assignedCourses || []).map((course) => course.title),
+      ...fields.map((field) => getUserFieldValue(item, field))
+    ],
+    [fields]
+  );
+
+  const filteredBySelects = useMemo(
+    () => users.filter((item) => {
+      if (!matchesSelected(item.status, filters.status || [])) return false;
+      if (!matchesSelected(item.role, filters.role || [])) return false;
+      return filterableFields.every((field) => matchesSelected(getUserFieldValue(item, field), filters[field.key] || []));
+    }),
+    [users, filters, filterableFields]
+  );
+
+  const list = useFilteredPagination(filteredBySelects, getSearchValues, { initialPageSize: 10 });
+  const pageIds = list.pageItems.map((item) => item.id);
+  const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
+  const visibleTableColumns = tableColumns.filter((column) => visibleColumns.includes(column.key));
+
+  function cellValue(item: UserView, key: string): string {
+    if (key === "learnerName") return `${item.firstName} ${item.lastName}`.trim();
+    if (key === "email") return item.email;
+    if (key === "role") return roles.find((roleItem) => roleItem.key === item.role)?.name || item.role;
+    if (key === "status") return item.status;
+    if (key === "assignedCourses") return (item.assignedCourses || []).map((course) => course.title).join("; ");
+    const field = fields.find((itemField) => itemField.key === key);
+    return field ? getUserFieldValue(item, field) : "";
+  }
+
+  function exportFilteredCsv() {
+    const rows = filteredBySelects
+      .filter((item) => matchesQuery(getSearchValues(item), list.query))
+      .map((item) => Object.fromEntries(visibleTableColumns.map((column) => [column.key, cellValue(item, column.key)])));
+    downloadCsv(csvFilename("vectra-lms-users"), visibleTableColumns, rows);
+  }
+
+  function toggleSelected(id: string) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllPage() {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allPageSelected) pageIds.forEach((id) => next.delete(id));
+      else pageIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+
+  function toggleExpanded(id: string) {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function bulkRemoveSelected() {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    const confirmed = window.confirm(
+      `Remove ${ids.length} selected user(s)? This permanently deletes them and their course assignments.`
+    );
+    if (!confirmed) return;
+    setError("");
+    setMessage("");
+    const response = await fetch("/api/admin/users/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids })
+    });
+    const data = await response.json();
+    if (!response.ok) return setError(data.error || "Bulk remove failed");
+    const removed = new Set<string>(data.removedIds || []);
+    setUsers((items) => items.filter((item) => !removed.has(item.id)));
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      removed.forEach((id) => next.delete(id));
+      return next;
+    });
+    if (editingId && removed.has(editingId)) setEditingId(null);
+    setMessage(
+      `Removed ${data.removed} user(s)` +
+      (data.skipped ? `; ${data.skipped} could not be removed.` : ".") +
+      (data.errors?.length ? ` First issues: ${data.errors.slice(0, 3).join(" | ")}` : "")
+    );
+  }
+
+  async function createUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    setError("");
+    setMessage("");
+    const form = new FormData(formElement);
+    const payload = Object.fromEntries(form.entries());
+    const response = await fetch("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) return setError(data.error || "User creation failed");
+    setUsers((current) => [data.user, ...current]);
+    setMessage(data.message || "User created. An activation link has been sent to their email.");
+    formElement.reset();
+    setRole("LEARNER");
+    setStakeholderGroup("");
+  }
+
+  async function importCsv(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    setError("");
+    setMessage("");
+    const form = new FormData(formElement);
+    const response = await fetch("/api/admin/users/import", { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok) return setError(data.error || "Import failed");
+    setMessage(
+      `Imported ${data.created} users; ${data.skipped} rows were skipped.` +
+      (data.errors?.length ? ` First issues: ${data.errors.slice(0, 3).join(" | ")}` : "")
+    );
+    const refreshed = await fetch("/api/admin/users");
+    const body = await refreshed.json();
+    if (refreshed.ok && Array.isArray(body.users)) setUsers(body.users);
+    formElement.reset();
+  }
+
+  async function resendInvite(user: UserView) {
+    setError("");
+    setMessage("");
+    const response = await fetch(`/api/admin/users/${user.id}/resend`, { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) return setError(data.error || "Unable to resend activation email");
+    setMessage(data.message || `Activation email resent to ${user.email}.`);
+  }
+
+  async function setStatus(user: UserView, nextStatus: "ACTIVE" | "INACTIVE") {
+    setError("");
+    setMessage("");
+    const response = await fetch(`/api/admin/users/${user.id}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: nextStatus })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setError(data.error || "Unable to update user status");
+      return;
+    }
+    setUsers((items) => items.map((item) => (item.id === user.id ? { ...item, status: nextStatus } : item)));
+    setMessage(`${user.firstName} ${user.lastName} is now ${nextStatus === "ACTIVE" ? "active" : "inactive"}.`);
+  }
+
+  async function removeUser(user: UserView) {
+    const confirmed = window.confirm(
+      `Remove ${user.firstName} ${user.lastName} (${user.email})? This permanently deletes the user and their course assignments.`
+    );
+    if (!confirmed) return;
+    setError("");
+    setMessage("");
+    const response = await fetch(`/api/admin/users/${user.id}`, { method: "DELETE" });
+    const data = await response.json();
+    if (!response.ok) {
+      setError(data.error || "Unable to remove user");
+      return;
+    }
+    setUsers((items) => items.filter((item) => item.id !== user.id));
+    if (editingId === user.id) setEditingId(null);
+    setMessage(`${user.firstName} ${user.lastName} was removed.`);
+  }
+
+  function canEditUser(user: UserView) {
+    return permissions.canCreateStaff || user.role === "LEARNER";
+  }
+
+  async function saveUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!editing) return;
+    setError("");
+    setMessage("");
+
+    const form = new FormData(event.currentTarget);
+    const payload = editing.role === "LEARNER"
+      ? { name: String(form.get("name") || "").trim() }
+      : {
+          firstName: String(form.get("firstName") || "").trim(),
+          lastName: String(form.get("lastName") || "").trim(),
+          entity: String(form.get("entity") || "").trim()
+        };
+
+    const response = await fetch(`/api/admin/users/${editing.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) return setError(data.error || "Could not update user");
+
+    setUsers((current) => current.map((item) => (
+      item.id === editing.id ? { ...item, ...data.user, assignedCourses: item.assignedCourses } : item
+    )));
+    setMessage(`${data.user.firstName} ${data.user.lastName} has been updated.`);
+    setEditingId(null);
+  }
+
+  const colSpan = (permissions.canRemoveUsers ? 2 : 1) + visibleTableColumns.length;
+
+  return (
+    <div className="grid">
+      {error && <div className="alert error">{error}</div>}
+      {message && <div className="alert success">{message}</div>}
+
+      <div className="grid two">
+        <form className="card" onSubmit={createUser}>
+          <h2>Create and invite user</h2>
+          <p className="helper">Learners use the same fields as self-registration and must match the participant roster. Roster fields (country, topic, custom fields) are copied onto the learner record.</p>
+          <div className="field">
+            <label>Role</label>
+            <select className="select" name="role" value={role} onChange={(event) => setRole(event.target.value)}>
+              {roles
+                .filter((item) => item.key === "LEARNER" || permissions.canCreateStaff)
+                .map((item) => (
+                  <option key={item.key} value={item.key}>{item.name}</option>
+                ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>Corporate email</label>
+            <input className="input" name="email" type="email" required />
+          </div>
+
+          {role === "LEARNER" ? (
+            <>
+              <div className="field">
+                <label>Full name</label>
+                <input className="input" name="name" required />
+              </div>
+              <div className="field">
+                <label>Company ID</label>
+                <input className="input" name="companyId" required />
+              </div>
+              <div className="field">
+                <label>Stakeholder group</label>
+                <select
+                  className="select"
+                  name="stakeholderGroup"
+                  value={stakeholderGroup}
+                  onChange={(event) => setStakeholderGroup(event.target.value as StakeholderGroup | "")}
+                  required
+                >
+                  <option value="">Select one</option>
+                  <option value="Business Partner">Business Partner</option>
+                  <option value="Facility">Facility</option>
+                </select>
+              </div>
+              {stakeholderGroup && (
+                <div className="field">
+                  <label>Organizational name</label>
+                  <input className="input" name="facilityTraining" required />
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="grid two">
+                <div className="field"><label>First name</label><input className="input" name="firstName" required /></div>
+                <div className="field"><label>Last name</label><input className="input" name="lastName" required /></div>
+              </div>
+              <div className="field"><label>Entity or company</label><input className="input" name="entity" required /></div>
+            </>
+          )}
+          <button className="btn">Create and send activation email</button>
+        </form>
+
+        <form className="card" onSubmit={importCsv}>
+          <h2>Import learners</h2>
+          <p className="muted">
+            Upload CSV or XLSX. Required headers: First Name, Last Name, Corporate Email, Company ID, Stakeholder Group, Organizational Name.
+            Company ID and Stakeholder Group must match the participant roster.
+          </p>
+          <div className="field"><label>CSV or XLSX file</label><input className="input" name="file" type="file" accept={SPREADSHEET_ACCEPT} required /></div>
+          <button className="btn">Import users</button>
+        </form>
+      </div>
+
+      {editing && canEditUser(editing) && (
+        <form className="card" onSubmit={saveUser} key={editing.id}>
+          <h2>Edit user</h2>
+          <p className="helper">
+            Correct a misspelled name or update profile details. The user keeps their account and does not need to register again.
+          </p>
+          {editing.role === "LEARNER" ? (
+            <div className="field">
+              <label>Full name</label>
+              <input
+                className="input"
+                name="name"
+                defaultValue={`${editing.firstName} ${editing.lastName}`.trim()}
+                required
+              />
+            </div>
+          ) : (
+            <div className="grid two">
+              <div className="field">
+                <label>First name</label>
+                <input className="input" name="firstName" defaultValue={editing.firstName} required />
+              </div>
+              <div className="field">
+                <label>Last name</label>
+                <input className="input" name="lastName" defaultValue={editing.lastName} required />
+              </div>
+              <div className="field">
+                <label>Entity or company</label>
+                <input className="input" name="entity" defaultValue={editing.entity} required />
+              </div>
+            </div>
+          )}
+          <div className="actions">
+            <button className="btn" type="submit">Save changes</button>
+            <button className="btn secondary" type="button" onClick={() => setEditingId(null)}>Cancel</button>
+          </div>
+        </form>
+      )}
+
+      <ListControls
+        query={list.query}
+        onQueryChange={list.setQuery}
+        page={list.page}
+        totalPages={list.totalPages}
+        total={list.total}
+        pageSize={list.pageSize}
+        onPageChange={list.setPage}
+        onPageSizeChange={list.setPageSize}
+        searchPlaceholder="Search name, email, company ID…"
+        filters={(
+          <div className="filter-toolbar">
+            <div className="checkbox-filter-bar">
+              <CheckboxFilter
+                label="Status"
+                options={["INVITED", "ACTIVE", "INACTIVE"]}
+                optionLabels={{ INVITED: "Invited", ACTIVE: "Active", INACTIVE: "Inactive" }}
+                selected={filters.status || []}
+                onChange={(next) => { setFilters((current) => ({ ...current, status: next })); list.setPage(1); }}
+              />
+              <CheckboxFilter
+                label="Role"
+                options={uniqueSorted([
+                  ...roles.map((item) => item.key),
+                  ...users.map((item) => item.role)
+                ])}
+                optionLabels={Object.fromEntries(roles.map((item) => [item.key, item.name]))}
+                selected={filters.role || []}
+                onChange={(next) => { setFilters((current) => ({ ...current, role: next })); list.setPage(1); }}
+              />
+              {filterableFields.map((field) => (
+                <CheckboxFilter
+                  key={field.key}
+                  label={field.label}
+                  options={uniqueSorted([
+                    ...(field.options || []),
+                    ...users.map((item) => getUserFieldValue(item, field))
+                  ])}
+                  selected={filters[field.key] || []}
+                  onChange={(next) => {
+                    setFilters((current) => ({ ...current, [field.key]: next }));
+                    list.setPage(1);
+                  }}
+                />
+              ))}
+            </div>
+            <div className="actions">
+              <ColumnManager
+                columns={tableColumns}
+                visible={visibleColumns}
+                onChange={setVisibleColumns}
+                storageKey="otto-users-columns"
+              />
+              <button className="btn small" type="button" onClick={exportFilteredCsv}>Export CSV</button>
+            </div>
+          </div>
+        )}
+      />
+
+      {permissions.canRemoveUsers && selectedIds.size > 0 && (
+        <div className="card bulk-actions">
+          <span className="helper">{selectedIds.size} selected</span>
+          <div className="actions">
+            <button className="btn danger small" type="button" onClick={() => void bulkRemoveSelected()}>
+              Remove selected
+            </button>
+            <button className="btn secondary small" type="button" onClick={() => setSelectedIds(new Set())}>
+              Clear selection
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {permissions.canRemoveUsers && (
+                <th style={{ width: 40 }}>
+                  <input
+                    type="checkbox"
+                    aria-label="Select all on this page"
+                    checked={allPageSelected}
+                    onChange={toggleSelectAllPage}
+                  />
+                </th>
+              )}
+              {visibleTableColumns.map((column) => <th key={column.key}>{column.label}</th>)}
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!list.pageItems.length && (
+              <tr><td colSpan={colSpan}>No users match the current filters.</td></tr>
+            )}
+            {list.pageItems.map((item) => {
+              const courses = item.assignedCourses || [];
+              const expanded = expandedIds.has(item.id);
+              const shownCourses = expanded ? courses : courses.slice(0, 2);
+              return (
+                <tr key={item.id}>
+                  {permissions.canRemoveUsers && (
+                    <td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${item.firstName} ${item.lastName}`}
+                        checked={selectedIds.has(item.id)}
+                        onChange={() => toggleSelected(item.id)}
+                      />
+                    </td>
+                  )}
+                  {visibleTableColumns.map((column) => {
+                    if (column.key === "learnerName") {
+                      return <td key={column.key}><strong>{item.firstName} {item.lastName}</strong></td>;
+                    }
+                    if (column.key === "status") {
+                      return <td key={column.key}><span className={`badge ${item.status.toLowerCase()}`}>{item.status}</span></td>;
+                    }
+                    if (column.key === "assignedCourses") {
+                      return (
+                        <td key={column.key}>
+                          {!courses.length ? "—" : (
+                            <div>
+                              {shownCourses.map((course) => (
+                                <div key={course.title} className="helper">{course.title}</div>
+                              ))}
+                              {courses.length > 2 && (
+                                <button className="linkish" type="button" onClick={() => toggleExpanded(item.id)}>
+                                  {expanded ? "Show less" : `+${courses.length - 2} more`}
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    }
+                    return <td key={column.key}>{cellValue(item, column.key) || "—"}</td>;
+                  })}
+                  <td>
+                    <div className="actions">
+                      {canEditUser(item) && (
+                        <button className="btn secondary small" type="button" onClick={() => setEditingId(item.id)}>
+                          Edit
+                        </button>
+                      )}
+                      {item.status === "INVITED" && (permissions.canCreateStaff || item.role === "LEARNER") && (
+                        <>
+                          <button className="btn small" type="button" onClick={() => void resendInvite(item)}>
+                            Resend invite
+                          </button>
+                          <button className="btn secondary small" type="button" onClick={() => void setStatus(item, "INACTIVE")}>
+                            Deactivate
+                          </button>
+                        </>
+                      )}
+                      {item.status === "INACTIVE" && (permissions.canCreateStaff || item.role === "LEARNER") && (
+                        <button className="btn small" type="button" onClick={() => void setStatus(item, "ACTIVE")}>
+                          Activate
+                        </button>
+                      )}
+                      {item.status === "ACTIVE" && (permissions.canCreateStaff || item.role === "LEARNER") && (
+                        <button className="btn secondary small" type="button" onClick={() => void setStatus(item, "INACTIVE")}>
+                          Deactivate
+                        </button>
+                      )}
+                      {permissions.canRemoveUsers && (
+                        <button className="btn danger small" type="button" onClick={() => void removeUser(item)}>
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
