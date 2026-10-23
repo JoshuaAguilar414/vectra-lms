@@ -9,6 +9,38 @@ import { patchScormLaunchHtml } from "@/lib/scorm";
 import type { AssignmentDocument } from "@/lib/types";
 import { safeObjectId } from "@/lib/utils";
 
+const fileCache = new Map<string, { body: Buffer; expires: number }>();
+const accessCache = new Map<string, number>();
+const FILE_CACHE_MS = 10 * 60 * 1000;
+const ACCESS_CACHE_MS = 10 * 60 * 1000;
+const FILE_CACHE_MAX = 80;
+
+function cachedFile(key: string): Buffer | null {
+  const hit = fileCache.get(key);
+  if (!hit) return null;
+  if (hit.expires <= Date.now()) {
+    fileCache.delete(key);
+    return null;
+  }
+  fileCache.delete(key);
+  fileCache.set(key, hit);
+  return hit.body;
+}
+
+function storeFile(key: string, body: Buffer) {
+  if (body.length > 8 * 1024 * 1024) return;
+  if (fileCache.has(key)) {
+    fileCache.set(key, { body, expires: Date.now() + FILE_CACHE_MS });
+    return;
+  }
+  while (fileCache.size >= FILE_CACHE_MAX) {
+    const oldest = fileCache.keys().next().value;
+    if (!oldest) break;
+    fileCache.delete(oldest);
+  }
+  fileCache.set(key, { body, expires: Date.now() + FILE_CACHE_MS });
+}
+
 export async function GET(_request: Request, { params }: { params: Promise<{ courseId: string; path: string[] }> }) {
   const user = await requireApiUser();
   if (isApiError(user)) return user;
@@ -17,12 +49,17 @@ export async function GET(_request: Request, { params }: { params: Promise<{ cou
   if (!courseObjectId) return NextResponse.json({ error: "Invalid course" }, { status: 400 });
 
   if (user.role === "LEARNER") {
-    const db = await getDb();
-    const assignment = await db.collection<AssignmentDocument>("assignments").findOne({
-      userId: new ObjectId(user.id),
-      courseId: courseObjectId
-    });
-    if (!assignment) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    const accessKey = `${user.id}:${courseId}`;
+    const allowedUntil = accessCache.get(accessKey) || 0;
+    if (allowedUntil <= Date.now()) {
+      const db = await getDb();
+      const assignment = await db.collection<AssignmentDocument>("assignments").findOne({
+        userId: new ObjectId(user.id),
+        courseId: courseObjectId
+      });
+      if (!assignment) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+      accessCache.set(accessKey, Date.now() + ACCESS_CACHE_MS);
+    }
   }
 
   const decodedParts = routePath.map((part) => decodeURIComponent(part));
@@ -31,8 +68,11 @@ export async function GET(_request: Request, { params }: { params: Promise<{ cou
   }
   const relativePath = decodedParts.join("/");
 
+  const cacheKey = `${courseId}/${relativePath}`;
+
   try {
-    const file = await readCourseFile(courseId, relativePath);
+    const file = cachedFile(cacheKey) || await readCourseFile(courseId, relativePath);
+    if (file) storeFile(cacheKey, file);
     if (!file) {
       const backend = storageBackend();
       return NextResponse.json(

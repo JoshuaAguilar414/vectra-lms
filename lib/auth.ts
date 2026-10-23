@@ -133,10 +133,16 @@ function toSessionUser(
   };
 }
 
+const sessionCache = new Map<string, { user: SessionUser; expires: number }>();
+const SESSION_CACHE_MS = 15_000;
+
 export async function getCurrentUser(): Promise<SessionUser | null> {
   const cookieStore = await cookies();
   const token = cookieStore.get(COOKIE_NAME)?.value;
   if (!token) return null;
+
+  const cached = sessionCache.get(token);
+  if (cached && cached.expires > Date.now()) return cached.user;
 
   try {
     const { payload } = await jwtVerify(token, secret());
@@ -148,7 +154,13 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     const user = await db.collection<UserDocument>("users").findOne({ _id: objectId, status: "ACTIVE" });
     if (!user?._id) return null;
     const roleDoc = (await getRoleByKey(db, user.role)) || fallbackRole(user.role);
-    return toSessionUser(user, roleDoc);
+    const sessionUser = toSessionUser(user, roleDoc);
+    if (sessionCache.size > 200) {
+      const oldest = sessionCache.keys().next().value;
+      if (oldest) sessionCache.delete(oldest);
+    }
+    sessionCache.set(token, { user: sessionUser, expires: Date.now() + SESSION_CACHE_MS });
+    return sessionUser;
   } catch {
     return null;
   }

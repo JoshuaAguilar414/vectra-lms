@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { formatAssignmentStatus } from "@/lib/assignment-display";
 import LoadingSpinner from "@/components/LoadingSpinner";
 import { extractProgressFromScormMessage } from "@/lib/scorm-progress";
@@ -22,14 +22,7 @@ interface Scorm12Api {
   LMSGetDiagnostic(code: string): string;
 }
 
-type LoadPhase = "preparing" | "loading-wrapper" | "loading-content" | "ready";
-
 const MINDSMITH_ORIGIN = "https://app.mindsmith.ai";
-const CONTENT_READY_TIMEOUT_MS = 45000;
-
-function nextFrame(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
-}
 
 export default function ScormPlayer({
   assignmentId,
@@ -46,17 +39,18 @@ export default function ScormPlayer({
 }) {
   const valuesRef = useRef<Record<string, string>>({ ...initialValues });
   const initializedRef = useRef(false);
-  const contentReadyRef = useRef(false);
+  const revealedRef = useRef(false);
+  const reloadAttemptRef = useRef(0);
+  const mountGeneration = useRef(0);
   const [saveState, setSaveState] = useState("Ready");
   const [courseStatus, setCourseStatus] = useState<AssignmentStatus>(initialStatus);
-  const [loadPhase, setLoadPhase] = useState<LoadPhase>("preparing");
   const [iframeSrc, setIframeSrc] = useState<string | null>(null);
-  const [loadingLabel, setLoadingLabel] = useState("Preparing course player…");
+  const [showOverlay, setShowOverlay] = useState(true);
 
-  function markContentReady() {
-    if (contentReadyRef.current) return;
-    contentReadyRef.current = true;
-    setLoadPhase("ready");
+  function revealCourse() {
+    if (revealedRef.current) return;
+    revealedRef.current = true;
+    setShowOverlay(false);
   }
 
   async function commit() {
@@ -83,28 +77,11 @@ export default function ScormPlayer({
     }
   }
 
-  useEffect(() => {
-    contentReadyRef.current = false;
+  useLayoutEffect(() => {
+    revealedRef.current = false;
+    reloadAttemptRef.current = 0;
     initializedRef.current = false;
-    setLoadPhase("preparing");
-    setIframeSrc(null);
-    setLoadingLabel("Preparing course player…");
-
-    const preconnect = document.createElement("link");
-    preconnect.rel = "preconnect";
-    preconnect.href = MINDSMITH_ORIGIN;
-    preconnect.crossOrigin = "anonymous";
-
-    const dnsPrefetch = document.createElement("link");
-    dnsPrefetch.rel = "dns-prefetch";
-    dnsPrefetch.href = MINDSMITH_ORIGIN;
-
-    const preloadBridge = document.createElement("link");
-    preloadBridge.rel = "preload";
-    preloadBridge.href = "/mindsmith-scorm-interface.js";
-    preloadBridge.as = "script";
-
-    document.head.append(preconnect, dnsPrefetch, preloadBridge);
+    setShowOverlay(true);
 
     let lastError = "0";
     const api: Scorm12Api = {
@@ -114,10 +91,7 @@ export default function ScormPlayer({
           valuesRef.current["cmi.core.lesson_status"] = "incomplete";
         }
         setCourseStatus("IN_PROGRESS");
-        setLoadingLabel("Loading course content…");
-        window.setTimeout(() => {
-          if (initializedRef.current) markContentReady();
-        }, 2500);
+        revealCourse();
         lastError = "0";
         void commit();
         return "true";
@@ -151,11 +125,42 @@ export default function ScormPlayer({
       LMSGetErrorString: (code) => code === "0" ? "No error" : "SCORM runtime error",
       LMSGetDiagnostic: (code) => `SCORM 1.2 diagnostic code ${code}`
     };
-    window.API = api;
 
-    const readyTimeout = window.setTimeout(() => {
-      markContentReady();
-    }, CONTENT_READY_TIMEOUT_MS);
+    // The course script looks up parent.API the moment it runs. Install it
+    // before the iframe is inserted so the first open does not miss it.
+    window.API = api;
+    const generation = ++mountGeneration.current;
+    setIframeSrc(launchUrl);
+
+    return () => {
+      const seen = generation;
+      queueMicrotask(() => {
+        if (mountGeneration.current !== seen) return;
+        if (initializedRef.current) void commit();
+        if (window.API === api) delete window.API;
+        setIframeSrc(null);
+      });
+    };
+    // commit closes over the current assignment and is safe for this mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assignmentId, launchUrl]);
+
+  useEffect(() => {
+    const preconnect = document.createElement("link");
+    preconnect.rel = "preconnect";
+    preconnect.href = MINDSMITH_ORIGIN;
+    preconnect.crossOrigin = "anonymous";
+
+    const dnsPrefetch = document.createElement("link");
+    dnsPrefetch.rel = "dns-prefetch";
+    dnsPrefetch.href = MINDSMITH_ORIGIN;
+
+    const preloadBridge = document.createElement("link");
+    preloadBridge.rel = "preload";
+    preloadBridge.href = "/mindsmith-scorm-interface.js";
+    preloadBridge.as = "script";
+
+    document.head.append(preconnect, dnsPrefetch, preloadBridge);
 
     const handleBridgeMessage = (event: MessageEvent) => {
       if (event.origin !== window.location.origin) return;
@@ -163,9 +168,7 @@ export default function ScormPlayer({
       if (!payload || typeof payload !== "object" || payload.type !== "otto-scorm-child-message") return;
 
       const childOrigin = typeof payload.origin === "string" ? payload.origin : "";
-      if (childOrigin.includes("mindsmith.ai")) {
-        markContentReady();
-      }
+      if (childOrigin.includes("mindsmith.ai")) revealCourse();
 
       const progressMeasure = extractProgressFromScormMessage(payload.data);
       if (progressMeasure !== undefined) {
@@ -187,16 +190,7 @@ export default function ScormPlayer({
     window.addEventListener("message", handleBridgeMessage);
     window.addEventListener("message", handleProgressMessage);
 
-    void (async () => {
-      await nextFrame();
-      setLoadPhase("loading-wrapper");
-      setLoadingLabel("Loading course package…");
-      await nextFrame();
-      setIframeSrc(launchUrl);
-    })();
-
     return () => {
-      window.clearTimeout(readyTimeout);
       window.clearInterval(timer);
       window.removeEventListener("pagehide", saveBeforeLeave);
       window.removeEventListener("message", handleBridgeMessage);
@@ -204,19 +198,28 @@ export default function ScormPlayer({
       preconnect.remove();
       dnsPrefetch.remove();
       preloadBridge.remove();
-      void commit();
-      delete window.API;
     };
-    // initialValues are intentionally loaded once for the SCORM runtime session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assignmentId, launchUrl]);
+  }, [assignmentId]);
 
-  function handleIframeLoad() {
-    setLoadPhase("loading-content");
-    setLoadingLabel("Loading course content…");
+  function handleIframeLoad(event: React.SyntheticEvent<HTMLIFrameElement>) {
+    const frame = event.currentTarget;
+    let lessonReady = true;
+    try {
+      lessonReady = Boolean(frame.contentDocument?.getElementById("lessonscript"));
+    } catch {
+      lessonReady = true;
+    }
+
+    if (!lessonReady && reloadAttemptRef.current < 1) {
+      reloadAttemptRef.current += 1;
+      const separator = launchUrl.includes("?") ? "&" : "?";
+      setIframeSrc(`${launchUrl}${separator}reload=${reloadAttemptRef.current}`);
+      return;
+    }
+
+    revealCourse();
   }
-
-  const isLoading = loadPhase !== "ready";
 
   return (
     <div className="scorm-shell">
@@ -233,17 +236,17 @@ export default function ScormPlayer({
         </div>
       </div>
       <div className="scorm-frame-wrap">
-        {isLoading && (
+        {showOverlay && (
           <div className="scorm-loading-overlay">
-            <LoadingSpinner label={loadingLabel} />
+            <LoadingSpinner label="Loading course…" />
           </div>
         )}
         {iframeSrc ? (
           <iframe
-            className={`scorm-frame${isLoading ? " scorm-frame-hidden" : ""}`}
+            className="scorm-frame"
             src={iframeSrc}
             title={courseTitle}
-            allow="fullscreen"
+            allow="fullscreen; autoplay"
             onLoad={handleIframeLoad}
           />
         ) : null}

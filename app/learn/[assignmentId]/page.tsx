@@ -32,7 +32,6 @@ export default async function LearnPage({ params }: { params: Promise<{ assignme
       <link rel="preconnect" href="https://app.mindsmith.ai" crossOrigin="anonymous" />
       <link rel="dns-prefetch" href="https://app.mindsmith.ai" />
       <link rel="preload" href="/mindsmith-scorm-interface.js" as="script" />
-      <link rel="prefetch" href={launchUrl} />
       <ScormPlayer
         assignmentId={assignmentId}
         courseTitle={course.title}

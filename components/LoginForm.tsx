@@ -46,7 +46,14 @@ export default function LoginForm() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: form.get("email"), password: form.get("password") })
     });
-    const data = await response.json();
+    let data: { error?: string; redirectTo?: string } = {};
+    try {
+      data = await response.json();
+    } catch {
+      setError("Unable to sign in (server error)");
+      setBusy(false);
+      return;
+    }
     if (!response.ok) {
       setError(data.error || "Unable to sign in");
       setBusy(false);

@@ -28,6 +28,10 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" data-tenant={branding.tenant} className={poppins.variable}>
+      <head>
+        <link rel="preconnect" href="https://app.mindsmith.ai" crossOrigin="anonymous" />
+        <link rel="dns-prefetch" href="https://app.mindsmith.ai" />
+      </head>
       <body className={branding.tenant === "vectra" ? poppins.className : undefined}>
         {children}
       </body>
